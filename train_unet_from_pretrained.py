@@ -1,37 +1,33 @@
 """
-Train U-Net Student Model from Pretrained Teacher Models
-=========================================================
-This script trains a lightweight U-Net student model via knowledge distillation
-from one or more pretrained Restormer teacher models.
+Train U-Net Student via Knowledge Distillation from Pretrained Teacher
+======================================================================
+Advanced training pipeline with:
+  - Perceptual Distillation Loss (Charbonnier + MSE + SSIM-proxy)
+  - Automatic Mixed Precision (AMP)
+  - Cosine Annealing LR scheduler
+  - Gradient clipping & early stopping
+  - Train/validation split with checkpointing
 
-Pretrained models available:
-  - teacher_best.pt      : Base Restormer trained on BDD100k
+Pretrained teacher models:
+  - teacher_best.pt      : Base Restormer (BDD100k)
   - cityscapes_final.pt  : Restormer fine-tuned on Cityscapes
-  - blended_model.pt     : 50/50 weight blend of the above two
+  - blended_model.pt     : 50/50 weight blend of the above
 
 Usage:
-  # Train using the blended (ensemble) teacher:
-  python train_unet_from_pretrained.py --teacher_weights blended_model.pt
-
-  # Train using the base teacher:
-  python train_unet_from_pretrained.py --teacher_weights teacher_best.pt
-
-  # Train with custom hyperparameters:
-  python train_unet_from_pretrained.py --teacher_weights blended_model.pt --batch_size 8 --epochs 100 --lr 5e-4
-
-  # Resume training from a checkpoint:
-  python train_unet_from_pretrained.py --teacher_weights blended_model.pt --resume distilled_unet_checkpoint.pt
+    python train_unet_from_pretrained.py --teacher_weights blended_model.pt
+    python train_unet_from_pretrained.py --teacher_weights teacher_best.pt --epochs 100
+    python train_unet_from_pretrained.py --resume distilled_unet_checkpoint.pt
 """
+
+import argparse
+import os
+import time
+from datetime import datetime
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-from torch.cuda.amp import autocast, GradScaler
-import argparse
-import os
-import time
-from datetime import datetime
 
 from data.dataset import OmniSightDataset
 from models.autoencoder import UNet
@@ -43,7 +39,8 @@ from models.restormer import Restormer
 # ──────────────────────────────────────────────────────────────────────────────
 
 class CharbonnierLoss(nn.Module):
-    """Smooth L1 alternative – better for image restoration than MSE."""
+    """Smooth L1 alternative — better for image restoration than MSE."""
+
     def __init__(self, eps=1e-3):
         super().__init__()
         self.eps = eps
@@ -54,12 +51,12 @@ class CharbonnierLoss(nn.Module):
 
 
 class PerceptualDistillationLoss(nn.Module):
+    """Combined loss for distillation:
+      - Charbonnier  : pixel-level fidelity
+      - MSE          : smooth gradient signal
+      - SSIM-proxy   : structural similarity via mean/variance matching
     """
-    Combined loss for distillation:
-      - Charbonnier loss  : pixel-level fidelity to teacher output
-      - MSE loss          : smooth gradient signal for stable training
-      - SSIM-proxy loss   : structural similarity via mean/variance matching
-    """
+
     def __init__(self, alpha=0.6, beta=0.3, gamma=0.1):
         super().__init__()
         self.alpha = alpha
@@ -74,17 +71,12 @@ class PerceptualDistillationLoss(nn.Module):
         mu_target = target.mean(dim=[2, 3], keepdim=True)
         var_pred = ((pred - mu_pred) ** 2).mean(dim=[2, 3], keepdim=True)
         var_target = ((target - mu_target) ** 2).mean(dim=[2, 3], keepdim=True)
-
-        # Mean difference + variance difference
-        mean_loss = self.mse(mu_pred, mu_target)
-        var_loss = self.mse(var_pred, var_target)
-        return mean_loss + var_loss
+        return self.mse(mu_pred, mu_target) + self.mse(var_pred, var_target)
 
     def forward(self, pred, target):
-        loss_charb = self.charbonnier(pred, target)
-        loss_mse = self.mse(pred, target)
-        loss_ssim = self._ssim_proxy(pred, target)
-        return self.alpha * loss_charb + self.beta * loss_mse + self.gamma * loss_ssim
+        return (self.alpha * self.charbonnier(pred, target)
+                + self.beta * self.mse(pred, target)
+                + self.gamma * self._ssim_proxy(pred, target))
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -92,14 +84,14 @@ class PerceptualDistillationLoss(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def count_parameters(model):
-    """Return total and trainable parameter counts."""
+    """Return (total, trainable) parameter counts."""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total, trainable
 
 
 def format_time(seconds):
-    """Format seconds into HH:MM:SS."""
+    """Format seconds as HH:MM:SS."""
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
@@ -107,7 +99,7 @@ def format_time(seconds):
 
 
 def print_banner(teacher_path, device, student_params, teacher_params, dataset_size):
-    """Print a nice training summary banner."""
+    """Print a training summary banner."""
     print("\n" + "=" * 70)
     print("  🎓  U-Net Student Training via Knowledge Distillation")
     print("=" * 70)
@@ -118,7 +110,7 @@ def print_banner(teacher_path, device, student_params, teacher_params, dataset_s
         vram = torch.cuda.get_device_properties(0).total_mem / 1e9
         print(f"  VRAM            : {vram:.1f} GB")
     else:
-        print("(⚠ CPU – training will be slow!)")
+        print("(⚠ CPU – training will be slow)")
     print(f"  Teacher params  : {teacher_params:,}")
     print(f"  Student params  : {student_params:,}  "
           f"({student_params / teacher_params * 100:.1f}% of teacher)")
@@ -132,11 +124,16 @@ def print_banner(teacher_path, device, student_params, teacher_params, dataset_s
 
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_amp = args.amp and device.type == 'cuda'
+
+    if not os.path.isdir(args.data_dir):
+        print(f"WARNING: Data directory '{args.data_dir}' not found. "
+              "Dataset will fall back to synthetic noise.")
 
     # ── Dataset ───────────────────────────────────────────────────────────
     full_dataset = OmniSightDataset(
         bdd100k_dir=args.data_dir,
-        real_rain_dir=args.real_rain_dir
+        real_rain_dir=args.real_rain_dir,
     )
 
     # Train / Validation split (90/10)
@@ -145,25 +142,25 @@ def main(args):
     train_size = total - val_size
     train_dataset, val_dataset = random_split(
         full_dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
+        generator=torch.Generator().manual_seed(42),
     )
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size,
         shuffle=True, num_workers=args.num_workers,
-        pin_memory=(device.type == 'cuda')
+        pin_memory=(device.type == 'cuda'),
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size,
         shuffle=False, num_workers=args.num_workers,
-        pin_memory=(device.type == 'cuda')
+        pin_memory=(device.type == 'cuda'),
     )
 
     # ── Teacher (frozen) ──────────────────────────────────────────────────
     teacher = Restormer(in_channels=3, out_channels=3, dim=32).to(device)
     if os.path.exists(args.teacher_weights):
         teacher.load_state_dict(
-            torch.load(args.teacher_weights, map_location=device)
+            torch.load(args.teacher_weights, map_location=device, weights_only=True)
         )
         print(f"✅ Loaded teacher weights: {args.teacher_weights}")
     else:
@@ -176,35 +173,34 @@ def main(args):
     # ── Student (trainable) ───────────────────────────────────────────────
     student = UNet(in_channels=6, out_channels=3).to(device)
 
-    # Optionally resume from a previous student checkpoint
+    # Optionally resume from a previous checkpoint
     start_epoch = 0
     best_val_loss = float('inf')
     if args.resume and os.path.exists(args.resume):
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=True)
         if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
             student.load_state_dict(checkpoint['model_state_dict'])
             start_epoch = checkpoint.get('epoch', 0)
             best_val_loss = checkpoint.get('best_val_loss', float('inf'))
             print(f"✅ Resumed from checkpoint: {args.resume} (epoch {start_epoch})")
         else:
-            # Plain state_dict
             student.load_state_dict(checkpoint)
             print(f"✅ Loaded student weights: {args.resume}")
 
     # ── Optimizer, Scheduler, Loss ────────────────────────────────────────
     optimizer = optim.AdamW(student.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
+        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
     )
     criterion = PerceptualDistillationLoss()
-    scaler = GradScaler(enabled=(device.type == 'cuda' and args.amp))
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
     # ── Print info ────────────────────────────────────────────────────────
     teacher_total, _ = count_parameters(teacher)
     student_total, student_trainable = count_parameters(student)
     print_banner(
         args.teacher_weights, device,
-        student_trainable, teacher_total, total
+        student_trainable, teacher_total, total,
     )
     print(f"  Hyperparameters:")
     print(f"    Batch size    : {args.batch_size}")
@@ -212,7 +208,7 @@ def main(args):
     print(f"    Learning rate : {args.lr}")
     print(f"    Loss          : Perceptual Distillation (Charb + MSE + SSIM-proxy)")
     print(f"    Scheduler     : Cosine Annealing")
-    print(f"    AMP           : {'Enabled' if args.amp else 'Disabled'}")
+    print(f"    AMP           : {'Enabled' if use_amp else 'Disabled'}")
     print(f"    Grad clip     : {args.grad_clip}")
     print()
 
@@ -229,15 +225,15 @@ def main(args):
             input_6ch = batch['input_6ch'].to(device, non_blocking=True)
             noisy_t = batch['noisy_t'].to(device, non_blocking=True)
 
-            # Teacher forward (frozen, no grad)
+            # Teacher forward (frozen)
             with torch.no_grad():
                 teacher_output = teacher(noisy_t)
 
             # Student forward + loss
             optimizer.zero_grad(set_to_none=True)
 
-            if args.amp and device.type == 'cuda':
-                with autocast():
+            if use_amp:
+                with torch.amp.autocast('cuda'):
                     student_output = student(input_6ch)
                     loss = criterion(student_output, teacher_output)
                 scaler.scale(loss).backward()
@@ -284,19 +280,15 @@ def main(args):
         avg_val_loss = val_loss / max(1, len(val_loader))
         epoch_time = time.time() - epoch_start
 
-        # Step the scheduler
         scheduler.step()
 
         print(f"\n{'─' * 60}")
-        print(
-            f"  Epoch {epoch+1}/{args.epochs} complete in {format_time(epoch_time)}"
-        )
+        print(f"  Epoch {epoch+1}/{args.epochs} complete in {format_time(epoch_time)}")
         print(f"    Train Loss : {avg_train_loss:.6f}")
         print(f"    Val   Loss : {avg_val_loss:.6f}")
         print(f"    Best  Loss : {best_val_loss:.6f}")
 
         # ── Checkpointing ─────────────────────────────────────────────────
-        # Save latest checkpoint every epoch
         checkpoint_data = {
             'epoch': epoch + 1,
             'model_state_dict': student.state_dict(),
@@ -321,7 +313,7 @@ def main(args):
 
         # Early stopping
         if args.patience > 0 and patience_counter >= args.patience:
-            print(f"  🛑 Early stopping triggered after {args.patience} epochs without improvement.")
+            print(f"  🛑 Early stopping after {args.patience} epochs without improvement.")
             break
 
     # ── Final Summary ─────────────────────────────────────────────────────
@@ -338,30 +330,20 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='Train U-Net student via distillation from pretrained teacher models'
+        description='Train U-Net student via distillation from pretrained teacher'
     )
 
     # Data
-    parser.add_argument(
-        '--data_dir', type=str,
-        default=r'D:\soft computing data\bdd100k\bdd100k\images\10k\train',
-        help='Path to BDD100k training images'
-    )
-    parser.add_argument(
-        '--real_rain_dir', type=str, default='',
-        help='Path to real rain dataset (optional)'
-    )
+    parser.add_argument('--data_dir', type=str, default='./data/train',
+                        help='Path to training images directory')
+    parser.add_argument('--real_rain_dir', type=str, default='',
+                        help='Path to real-rain dataset (optional)')
 
     # Model
-    parser.add_argument(
-        '--teacher_weights', type=str, default='blended_model.pt',
-        help='Path to pretrained teacher weights '
-             '(teacher_best.pt | cityscapes_final.pt | blended_model.pt)'
-    )
-    parser.add_argument(
-        '--resume', type=str, default='',
-        help='Path to student checkpoint to resume training from'
-    )
+    parser.add_argument('--teacher_weights', type=str, default='blended_model.pt',
+                        help='Path to pretrained teacher weights')
+    parser.add_argument('--resume', type=str, default='',
+                        help='Path to student checkpoint to resume from')
 
     # Training
     parser.add_argument('--batch_size', type=int, default=4)
@@ -373,7 +355,7 @@ if __name__ == '__main__':
                         help='Early stopping patience (0 to disable)')
     parser.add_argument('--amp', action='store_true', default=True,
                         help='Use automatic mixed precision on GPU')
-    parser.add_argument('--no_amp', action='store_true',
+    parser.add_argument('--no-amp', action='store_false', dest='amp',
                         help='Disable AMP')
 
     # Misc
@@ -381,8 +363,4 @@ if __name__ == '__main__':
     parser.add_argument('--log_interval', type=int, default=10,
                         help='Log every N batches')
 
-    args = parser.parse_args()
-    if args.no_amp:
-        args.amp = False
-
-    main(args)
+    main(parser.parse_args())

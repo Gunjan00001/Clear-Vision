@@ -1,8 +1,42 @@
+# ── Python ──
 __pycache__/
-*.mp4
-soft_venv/
-data/bdd100k/
-data/real_rain/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# ── IDE / Editor ──
 .vscode/
 .idea/
+*.swp
+*.swo
+
+# ── Jupyter ──
+.ipynb_checkpoints/
+
+# ── Virtual Environments ──
+soft_venv/
+venv/
+.venv/
+
+# ── Data (large, not tracked in git) ──
+data/bdd100k/
+data/real_rain/
+data/train/
+
+# ── Training Artifacts ──
+outputs/
+runs/
+wandb/
 *.log
+*.mp4
+
+# ── Model Exports ──
+*.onnx
+*.tflite
+*.engine
+
+# ── OS ──
+Thumbs.db
+.DS_Store

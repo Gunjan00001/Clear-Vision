@@ -1,6 +1,9 @@
-numpy
-torch
-torchvision
-opencv-python
-ultralytics
-albumentations
+# OmniSight Vision Pipeline — Pinned Dependencies
+# Install: pip install -r requirements.txt
+
+numpy>=1.24,<2.0
+torch>=2.0
+torchvision>=0.15
+opencv-python-headless>=4.8
+ultralytics>=8.0
+albumentations>=1.3
